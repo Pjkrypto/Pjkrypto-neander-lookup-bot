@@ -21,12 +21,12 @@ GALS = os.getenv("NEANDERGALS_CONTRACT", "").strip().lower()
 
 MAX_TRAITS = int(os.getenv("MAX_TRAITS", "50"))
 
-# Alchemy
+# Alchemy (trait rarity + metadata + minted-so-far proxy)
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "").strip()
 ALCHEMY_NETWORK = os.getenv("ALCHEMY_NETWORK", "polygon-mainnet").strip()
 ALCHEMY_BASE_URL = os.getenv("ALCHEMY_BASE_URL", "").strip().rstrip("/")
 
-# OpenSea (for overall rarity rank)
+# OpenSea (overall rarity rank)
 OPENSEA_API_KEY = os.getenv("OPENSEA_API_KEY", "").strip()
 
 if not TELEGRAM_BOT_TOKEN:
@@ -39,6 +39,19 @@ if not BROS:
     raise SystemExit("Missing NEANDERBROS_CONTRACT")
 if not GALS:
     raise SystemExit("Missing NEANDERGALS_CONTRACT")
+
+
+# -----------------------
+# BEST-PRACTICE DISPLAY ID RULE
+# -----------------------
+# OpenSea’s API reliably identifies NFTs by on-chain tokenId. The UI label “NeanderBros #1418”
+# is a collection display convention (tokenId + 1) and is NOT consistently exposed by OpenSea.
+# Best practice here is to keep tokenId as source-of-truth and apply an explicit, per-collection
+# display offset for your header only.
+DISPLAY_ID_OFFSETS: Dict[str, int] = {
+    BROS: 1,  # NeanderBros: UI shows tokenId+1
+    GALS: 0,  # NeanderGals: UI matches tokenId
+}
 
 
 def _alchemy_root() -> str:
@@ -69,6 +82,11 @@ def _collection_label(contract: str) -> str:
     return "NFT"
 
 
+def _display_nft_id(contract: str, token_id: int) -> int:
+    c = (contract or "").lower()
+    return token_id + DISPLAY_ID_OFFSETS.get(c, 0)
+
+
 def _safe_int(v: Any) -> Optional[int]:
     try:
         if v is None or isinstance(v, bool):
@@ -87,12 +105,18 @@ def _prevalence_to_pct(prevalence: Any) -> Optional[float]:
         p = float(prevalence)
     except Exception:
         return None
+    # Heuristic: <=1.0 means fraction
     if p <= 1.0:
         return p * 100.0
     return p
 
 
-async def _get_json(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: float = 25.0) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def _get_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = 25.0,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     h = {"accept": "application/json"}
     if headers:
         h.update(headers)
@@ -136,9 +160,7 @@ async def fetch_compute_rarity_alchemy(contract: str, token_id: int) -> Tuple[Op
 
 async def fetch_minted_so_far_alchemy(contract: str) -> Tuple[Optional[int], Optional[str]]:
     """
-    Use Alchemy getContractMetadata totalSupply when available,
-    but you asked specifically for 'minted in collection so far'.
-    totalSupply is usually the best "indexed minted so far" proxy without scanning events.
+    Uses Alchemy getContractMetadata.totalSupply as a practical “minted/indexed so far” proxy.
     """
     url = f"{_alchemy_root()}/getContractMetadata"
     params = {"contractAddress": contract}
@@ -180,6 +202,10 @@ def _extract_traits(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _build_trait_pct_map_from_alchemy(rarity_resp: Dict[str, Any]) -> Dict[Tuple[str, str], float]:
+    """
+    Map (trait_type_norm, value_norm) -> percent
+    Handles key naming differences (traitType vs trait_type, etc).
+    """
     out: Dict[Tuple[str, str], float] = {}
     rarities = rarity_resp.get("rarities")
     if not isinstance(rarities, list):
@@ -241,14 +267,12 @@ async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int
     if not isinstance(nft, dict):
         return None, "Unexpected OpenSea response."
 
-    # Try common OpenSea shapes
     rarity = nft.get("rarity")
     if isinstance(rarity, dict):
         rank = _safe_int(rarity.get("rank"))
         if rank is not None:
             return rank, None
 
-    # Sometimes nested or different naming
     rank = _safe_int(nft.get("rarity_rank") or nft.get("rarityRank"))
     return rank, None
 
@@ -270,12 +294,12 @@ async def handle_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, cont
         await update.message.reply_text(err)
         return
 
-    # Minted so far (using contract totalSupply as best proxy)
+    # Minted so far
     minted_so_far, minted_err = await fetch_minted_so_far_alchemy(contract)
     if minted_err:
         minted_so_far = None
 
-    # Alchemy trait prevalence map
+    # Trait prevalence map
     rarity_resp, r_err = await fetch_compute_rarity_alchemy(contract, token_id)
     trait_pct_map: Dict[Tuple[str, str], float] = {}
     if not r_err and isinstance(rarity_resp, dict):
@@ -283,19 +307,19 @@ async def handle_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, cont
 
     # OpenSea overall rank
     os_rank, os_rank_err = await fetch_opensea_rank(contract, token_id)
-    # If it errors, just omit it rather than failing the whole message
     if os_rank_err:
         os_rank = None
 
     coll = _collection_label(contract)
+    nft_id = _display_nft_id(contract, token_id)
 
-    # --- Header exactly as requested: two lines only ---
-    header1 = f"<b>{coll} NFT ID #{token_id}</b>"
+    # Header (two lines only, per your spec)
+    header1 = f"<b>{coll} NFT ID #{nft_id}</b>"
     header2 = f"Token ID #{token_id}"
     if minted_so_far:
         header2 += f" of {minted_so_far}"
 
-    # Traits (up to MAX_TRAITS=50)
+    # Traits
     traits = _extract_traits(meta or {})
     trait_lines: List[str] = []
     for a in traits[:MAX_TRAITS]:
@@ -320,6 +344,7 @@ async def handle_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, cont
     # Image
     image_url = _pick_image_url(meta or {})
 
+    # Links
     os_url = _opensea_url(contract, token_id)
 
     caption = (
