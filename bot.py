@@ -21,14 +21,20 @@ GALS = os.getenv("NEANDERGALS_CONTRACT", "").strip().lower()
 
 MAX_TRAITS = int(os.getenv("MAX_TRAITS", "50"))
 
+# Alchemy
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "").strip()
 ALCHEMY_NETWORK = os.getenv("ALCHEMY_NETWORK", "polygon-mainnet").strip()
 ALCHEMY_BASE_URL = os.getenv("ALCHEMY_BASE_URL", "").strip().rstrip("/")
+
+# OpenSea (for overall rarity rank)
+OPENSEA_API_KEY = os.getenv("OPENSEA_API_KEY", "").strip()
 
 if not TELEGRAM_BOT_TOKEN:
     raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
 if not ALCHEMY_API_KEY:
     raise SystemExit("Missing ALCHEMY_API_KEY")
+if not OPENSEA_API_KEY:
+    raise SystemExit("Missing OPENSEA_API_KEY")
 if not BROS:
     raise SystemExit("Missing NEANDERBROS_CONTRACT")
 if not GALS:
@@ -54,60 +60,93 @@ def _opensea_url(contract: str, token_id: int) -> str:
     return f"https://opensea.io/assets/{CHAIN}/{contract}/{token_id}"
 
 
-async def _get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: float = 25.0) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def _collection_label(contract: str) -> str:
+    c = (contract or "").lower()
+    if c == BROS:
+        return "NeanderBros"
+    if c == GALS:
+        return "NeanderGals"
+    return "NFT"
+
+
+def _safe_int(v: Any) -> Optional[int]:
+    try:
+        if v is None or isinstance(v, bool):
+            return None
+        return int(str(v), 0) if isinstance(v, str) and v.strip().lower().startswith("0x") else int(str(v))
+    except Exception:
+        return None
+
+
+def _norm(s: Any) -> str:
+    return str(s).strip().casefold()
+
+
+def _prevalence_to_pct(prevalence: Any) -> Optional[float]:
+    try:
+        p = float(prevalence)
+    except Exception:
+        return None
+    if p <= 1.0:
+        return p * 100.0
+    return p
+
+
+async def _get_json(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: float = 25.0) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    h = {"accept": "application/json"}
+    if headers:
+        h.update(headers)
+
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.get(url, params=params, headers={"accept": "application/json"})
+            r = await client.get(url, params=params, headers=h)
     except Exception as e:
-        return None, f"Network error calling Alchemy: {e}"
+        return None, f"Network error calling API: {e}"
 
     if r.status_code == 429:
-        return None, "Alchemy throttled the request (429). Please try again in ~10–20 seconds."
+        return None, "API throttled the request (429). Please try again in ~10–20 seconds."
     if r.status_code in (401, 403):
-        return None, f"Alchemy auth error ({r.status_code}). Check ALCHEMY_API_KEY / ALCHEMY_NETWORK."
+        return None, f"API auth error ({r.status_code}). Check your API key/env vars."
     if r.status_code >= 400:
-        return None, f"Alchemy error {r.status_code}: {r.text[:200]}"
+        return None, f"API error {r.status_code}: {r.text[:200]}"
 
     try:
         data = r.json()
         if isinstance(data, dict):
             return data, None
-        return None, "Unexpected Alchemy response (not a JSON object)."
+        return None, "Unexpected API response (not a JSON object)."
     except Exception:
-        return None, "Could not parse Alchemy response as JSON."
+        return None, "Could not parse API response as JSON."
 
 
-async def fetch_nft_metadata(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+# -----------------------
+# ALCHEMY CALLS
+# -----------------------
+async def fetch_nft_metadata_alchemy(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     url = f"{_alchemy_root()}/getNFTMetadata"
-    params = {
-        "contractAddress": contract,
-        "tokenId": str(token_id),
-        "refreshCache": "false",
-    }
+    params = {"contractAddress": contract, "tokenId": str(token_id), "refreshCache": "false"}
     return await _get_json(url, params=params)
 
 
-async def fetch_contract_metadata(contract: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    url = f"{_alchemy_root()}/getContractMetadata"
-    params = {"contractAddress": contract}
-    return await _get_json(url, params=params)
-
-
-async def fetch_compute_rarity(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def fetch_compute_rarity_alchemy(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     url = f"{_alchemy_root()}/computeRarity"
     params = {"contractAddress": contract, "tokenId": str(token_id)}
     return await _get_json(url, params=params)
 
 
-def _safe_int(v: Any) -> Optional[int]:
-    try:
-        if v is None:
-            return None
-        if isinstance(v, bool):
-            return None
-        return int(str(v), 0) if isinstance(v, str) and v.strip().lower().startswith("0x") else int(str(v))
-    except Exception:
-        return None
+async def fetch_minted_so_far_alchemy(contract: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Use Alchemy getContractMetadata totalSupply when available,
+    but you asked specifically for 'minted in collection so far'.
+    totalSupply is usually the best "indexed minted so far" proxy without scanning events.
+    """
+    url = f"{_alchemy_root()}/getContractMetadata"
+    params = {"contractAddress": contract}
+    data, err = await _get_json(url, params=params)
+    if err:
+        return None, err
+    minted = _safe_int((data or {}).get("totalSupply"))
+    return minted, None
 
 
 def _pick_image_url(meta: Dict[str, Any]) -> Optional[str]:
@@ -140,79 +179,7 @@ def _extract_traits(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def _norm(s: Any) -> str:
-    return str(s).strip().casefold()
-
-
-def _prevalence_to_pct(prevalence: Any) -> Optional[float]:
-    try:
-        p = float(prevalence)
-    except Exception:
-        return None
-    # Heuristic: <= 1.0 => fraction
-    if p <= 1.0:
-        return p * 100.0
-    return p
-
-
-async def _download_image_bytes(url: str) -> Optional[bytes]:
-    try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            r = await client.get(url, headers={"user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)"})
-            r.raise_for_status()
-            return r.content
-    except Exception:
-        return None
-
-
-def _format_trait_line(trait_type: str, value: str, pct: Optional[float], total_supply: Optional[int]) -> str:
-    if pct is None:
-        return f"{trait_type}: {value} — n/a"
-    pct_str = f"{pct:.2f}%"
-    if total_supply and total_supply > 0:
-        count = int(round((pct / 100.0) * total_supply))
-        return f"{trait_type}: {value} — {count} ({pct_str})"
-    return f"{trait_type}: {value} — ({pct_str})"
-
-
-def _collection_label(contract: str) -> str:
-    c = (contract or "").lower()
-    if c == BROS:
-        return "NeanderBros"
-    if c == GALS:
-        return "NeanderGals"
-    return "NFT"
-
-
-def _extract_overall_rarity(rarity_resp: Dict[str, Any]) -> Tuple[Optional[int], Optional[float]]:
-    """
-    Alchemy's computeRarity can include overall fields depending on collection/indexing.
-    We try common variants safely.
-    """
-    rank = _safe_int(
-        rarity_resp.get("rank")
-        or rarity_resp.get("rarityRank")
-        or (rarity_resp.get("rarity") or {}).get("rank") if isinstance(rarity_resp.get("rarity"), dict) else None
-    )
-    score = None
-    try:
-        score_val = (
-            rarity_resp.get("score")
-            or rarity_resp.get("rarityScore")
-            or (rarity_resp.get("rarity") or {}).get("score") if isinstance(rarity_resp.get("rarity"), dict) else None
-        )
-        if score_val is not None:
-            score = float(score_val)
-    except Exception:
-        score = None
-    return rank, score
-
-
-def _build_rarity_map(rarity_resp: Dict[str, Any]) -> Dict[Tuple[str, str], float]:
-    """
-    Map (trait_type_norm, value_norm) -> percent
-    Handles key naming differences: traitType vs trait_type, etc.
-    """
+def _build_trait_pct_map_from_alchemy(rarity_resp: Dict[str, Any]) -> Dict[Tuple[str, str], float]:
     out: Dict[Tuple[str, str], float] = {}
     rarities = rarity_resp.get("rarities")
     if not isinstance(rarities, list):
@@ -233,64 +200,104 @@ def _build_rarity_map(rarity_resp: Dict[str, Any]) -> Dict[Tuple[str, str], floa
     return out
 
 
+def _format_trait_line(trait_type: str, value: str, pct: Optional[float], minted_so_far: Optional[int]) -> str:
+    if pct is None:
+        return f"{trait_type}: {value} — n/a"
+
+    pct_str = f"{pct:.2f}%"
+    if minted_so_far and minted_so_far > 0:
+        count = int(round((pct / 100.0) * minted_so_far))
+        return f"{trait_type}: {value} — {count} ({pct_str})"
+    return f"{trait_type}: {value} — ({pct_str})"
+
+
+async def _download_image_bytes(url: str) -> Optional[bytes]:
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+            r = await client.get(url, headers={"user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)"})
+            r.raise_for_status()
+            return r.content
+    except Exception:
+        return None
+
+
+# -----------------------
+# OPENSEA CALL (RARITY RANK)
+# -----------------------
+async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int], Optional[str]]:
+    url = f"https://api.opensea.io/api/v2/chain/{CHAIN}/contract/{contract}/nfts/{token_id}"
+    headers = {
+        "accept": "application/json",
+        "x-api-key": OPENSEA_API_KEY,
+        "user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)",
+    }
+    data, err = await _get_json(url, params=None, headers=headers, timeout=25.0)
+    if err:
+        return None, err
+
+    nft = data.get("nft") if isinstance(data, dict) else None
+    if not isinstance(nft, dict):
+        nft = data if isinstance(data, dict) else None
+    if not isinstance(nft, dict):
+        return None, "Unexpected OpenSea response."
+
+    # Try common OpenSea shapes
+    rarity = nft.get("rarity")
+    if isinstance(rarity, dict):
+        rank = _safe_int(rarity.get("rank"))
+        if rank is not None:
+            return rank, None
+
+    # Sometimes nested or different naming
+    rank = _safe_int(nft.get("rarity_rank") or nft.get("rarityRank"))
+    return rank, None
+
+
+# -----------------------
+# HANDLER
+# -----------------------
 async def handle_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, contract: str, cmd_label: str) -> None:
-    requested_id = _parse_token_id(context.args)
-    if requested_id is None:
+    token_id = _parse_token_id(context.args)
+    if token_id is None:
         await update.message.reply_text(f"Usage: /{cmd_label} <tokenId>  (example: /{cmd_label} 33)")
         return
 
     await update.message.chat.send_action(action="typing")
 
-    meta, err = await fetch_nft_metadata(contract, requested_id)
+    # Alchemy metadata (image + traits)
+    meta, err = await fetch_nft_metadata_alchemy(contract, token_id)
     if err:
         await update.message.reply_text(err)
         return
 
-    # Determine on-chain tokenId from Alchemy response if present (can be hex or decimal)
-    onchain_id = _safe_int(meta.get("tokenId")) or requested_id
+    # Minted so far (using contract totalSupply as best proxy)
+    minted_so_far, minted_err = await fetch_minted_so_far_alchemy(contract)
+    if minted_err:
+        minted_so_far = None
 
-    # total supply
-    contract_meta, cm_err = await fetch_contract_metadata(contract)
-    total_supply = None
-    if not cm_err and isinstance(contract_meta, dict):
-        total_supply = _safe_int(contract_meta.get("totalSupply"))
-
-    # rarity
-    rarity_resp, r_err = await fetch_compute_rarity(contract, onchain_id)
-    rarity_map: Dict[Tuple[str, str], float] = {}
-    overall_rank: Optional[int] = None
-    overall_score: Optional[float] = None
+    # Alchemy trait prevalence map
+    rarity_resp, r_err = await fetch_compute_rarity_alchemy(contract, token_id)
+    trait_pct_map: Dict[Tuple[str, str], float] = {}
     if not r_err and isinstance(rarity_resp, dict):
-        rarity_map = _build_rarity_map(rarity_resp)
-        overall_rank, overall_score = _extract_overall_rarity(rarity_resp)
+        trait_pct_map = _build_trait_pct_map_from_alchemy(rarity_resp)
 
-    # name + image + traits
-    name = meta.get("name") if isinstance(meta.get("name"), str) and meta.get("name").strip() else f"Token #{onchain_id}"
-    image_url = _pick_image_url(meta)
-    traits = _extract_traits(meta)
+    # OpenSea overall rank
+    os_rank, os_rank_err = await fetch_opensea_rank(contract, token_id)
+    # If it errors, just omit it rather than failing the whole message
+    if os_rank_err:
+        os_rank = None
 
     coll = _collection_label(contract)
 
-    # Header formatting you requested
-    # If requested != onchain, show both to avoid confusion.
-    if onchain_id != requested_id:
-        header = f"<b>{coll} NFT ID #{requested_id}</b>\n<i>On-chain Token ID #{onchain_id}</i>"
-        token_line = f"Token ID #{onchain_id}" + (f" of {total_supply}" if total_supply else "")
-    else:
-        header = f"<b>{coll} NFT ID #{onchain_id}</b>"
-        token_line = f"Token ID #{onchain_id}" + (f" of {total_supply}" if total_supply else "")
+    # --- Header exactly as requested: two lines only ---
+    header1 = f"<b>{coll} NFT ID #{token_id}</b>"
+    header2 = f"Token ID #{token_id}"
+    if minted_so_far:
+        header2 += f" of {minted_so_far}"
 
-    rarity_lines: List[str] = []
-    rarity_lines.append("<b>Rarity</b>")
-    if overall_rank is not None:
-        rarity_lines.append(f"Rank: #{overall_rank}")
-    if overall_score is not None:
-        rarity_lines.append(f"Score: {overall_score:.2f}")
-    if overall_rank is None and overall_score is None:
-        rarity_lines.append("Overall rank not available from Alchemy for this item.")
-
-    # Traits
-    lines: List[str] = []
+    # Traits (up to MAX_TRAITS=50)
+    traits = _extract_traits(meta or {})
+    trait_lines: List[str] = []
     for a in traits[:MAX_TRAITS]:
         tt = a.get("trait_type") or a.get("type") or a.get("traitType") or "Trait"
         vv = a.get("value")
@@ -298,16 +305,26 @@ async def handle_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, cont
             continue
         vv_s = str(vv)
 
-        pct = rarity_map.get((_norm(tt), _norm(vv_s)))
-        lines.append(_format_trait_line(tt, vv_s, pct, total_supply))
+        pct = trait_pct_map.get((_norm(tt), _norm(vv_s)))
+        trait_lines.append(_format_trait_line(tt, vv_s, pct, minted_so_far))
 
-    traits_text = "\n".join(lines) if lines else "(No traits returned.)"
-    os_url = _opensea_url(contract, onchain_id)
+    traits_text = "\n".join(trait_lines) if trait_lines else "(No traits returned.)"
+
+    # Rarity block
+    rarity_lines = ["<b>Rarity (OpenSea)</b>"]
+    if os_rank is not None:
+        rarity_lines.append(f"Rank: #{os_rank}")
+    else:
+        rarity_lines.append("Rank not available from OpenSea API for this item.")
+
+    # Image
+    image_url = _pick_image_url(meta or {})
+
+    os_url = _opensea_url(contract, token_id)
 
     caption = (
-        f"{header}\n"
-        f"{token_line}\n\n"
-        f"{name}\n\n"
+        f"{header1}\n"
+        f"{header2}\n\n"
         f"{'\n'.join(rarity_lines)}\n\n"
         f"<b>Traits</b>\n"
         f"{traits_text}\n\n"
