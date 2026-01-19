@@ -626,9 +626,32 @@ def start_autopost_loop(job_queue) -> None:
 
 def main() -> None:
     from telegram.ext import Application, JobQueue
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).job_queue(JobQueue()).build()
+    from telegram.request import HTTPXRequest
+    from telegram import Update
+
+    # Hardening: longer timeouts reduce random httpx.ReadError during getUpdates polling.
+    # These are conservative values; you can adjust later if desired.
+    request = HTTPXRequest(
+        connect_timeout=15.0,
+        read_timeout=45.0,
+        write_timeout=45.0,
+        pool_timeout=15.0,
+    )
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .job_queue(JobQueue())
+        .build()
+    )
+
     if app.job_queue is None:
-        raise RuntimeError("JobQueue is not configured. Install python-telegram-bot[job-queue] and enable JobQueue in Application.builder().")
+        raise RuntimeError(
+            "JobQueue is not configured. Install python-telegram-bot[job-queue] "
+            "and enable JobQueue in Application.builder()."
+        )
+
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("bro", bro_cmd))
     app.add_handler(CommandHandler("gal", gal_cmd))
@@ -636,8 +659,9 @@ def main() -> None:
     if AUTOPOST_ENABLED:
         start_autopost_loop(app.job_queue)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+    # Hardening: clears any backlog of updates after downtime/restarts
+    # so the bot doesn’t stall processing a huge update queue.
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
