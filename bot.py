@@ -625,7 +625,10 @@ def start_autopost_loop(job_queue) -> None:
 
 
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    from telegram.ext import Application, JobQueue
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).job_queue(JobQueue()).build()
+    if app.job_queue is None:
+        raise RuntimeError("JobQueue is not configured. Install python-telegram-bot[job-queue] and enable JobQueue in Application.builder().")
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("bro", bro_cmd))
     app.add_handler(CommandHandler("gal", gal_cmd))
