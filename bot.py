@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -30,7 +31,7 @@ ALCHEMY_BASE_URL = os.getenv("ALCHEMY_BASE_URL", "").strip().rstrip("/")
 # OpenSea
 OPENSEA_API_KEY = os.getenv("OPENSEA_API_KEY", "").strip()
 
-# Bros have no token 0 (per your known info)
+# Bros have no token 0
 BROS_MIN_TOKEN_ID = int(os.getenv("BROS_MIN_TOKEN_ID", "1"))
 GALS_MIN_TOKEN_ID = int(os.getenv("GALS_MIN_TOKEN_ID", "0"))
 
@@ -49,7 +50,6 @@ if not GALS:
 # -----------------------
 # DISPLAY ID OFFSETS
 # -----------------------
-# NeanderBros UI shows tokenId+1; NeanderGals UI matches tokenId
 DISPLAY_ID_OFFSETS: Dict[str, int] = {
     BROS: 1,
     GALS: 0,
@@ -115,19 +115,39 @@ def _prevalence_to_pct(prevalence: Any) -> Optional[float]:
     return p
 
 
+# -----------------------
+# SHARED HTTP CLIENT
+# -----------------------
+_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=25.0, write=25.0, pool=15.0)
+
+DEFAULT_HEADERS = {
+    "accept": "application/json",
+    "user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)",
+}
+
+# single client reused for all requests
+_client: Optional[httpx.AsyncClient] = None
+
+
+async def get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True, headers=DEFAULT_HEADERS)
+    return _client
+
+
 async def _get_json(
     url: str,
     params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
-    timeout: float = 25.0,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    h = {"accept": "application/json"}
+    h = dict(DEFAULT_HEADERS)
     if headers:
         h.update(headers)
 
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.get(url, params=params, headers=h)
+        client = await get_client()
+        r = await client.get(url, params=params, headers=h)
     except Exception as e:
         return None, f"Network error calling API: {e}"
 
@@ -136,7 +156,8 @@ async def _get_json(
     if r.status_code in (401, 403):
         return None, f"API auth error ({r.status_code}). Check your API key/env vars."
     if r.status_code >= 400:
-        return None, f"API error {r.status_code}: {r.text[:200]}"
+        txt = (r.text or "")[:200]
+        return None, f"API error {r.status_code}: {txt}"
 
     try:
         data = r.json()
@@ -236,10 +257,14 @@ def _format_trait_line(trait_type: str, value: str, pct: Optional[float], minted
 
 async def _download_image_bytes(url: str) -> Optional[bytes]:
     try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            r = await client.get(url, headers={"user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)"})
-            r.raise_for_status()
-            return r.content
+        client = await get_client()
+        r = await client.get(url, headers={"accept": "*/*"})
+        r.raise_for_status()
+        # If the server returns something unexpected, fail gracefully
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "image" not in ctype and not url.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            return None
+        return r.content
     except Exception:
         return None
 
@@ -249,12 +274,8 @@ async def _download_image_bytes(url: str) -> Optional[bytes]:
 # -----------------------
 async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int], Optional[str]]:
     url = f"https://api.opensea.io/api/v2/chain/{CHAIN}/contract/{contract}/nfts/{token_id}"
-    headers = {
-        "accept": "application/json",
-        "x-api-key": OPENSEA_API_KEY,
-        "user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)",
-    }
-    data, err = await _get_json(url, params=None, headers=headers, timeout=25.0)
+    headers = {"x-api-key": OPENSEA_API_KEY}
+    data, err = await _get_json(url, params=None, headers=headers)
     if err:
         return None, err
 
@@ -346,6 +367,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Ready. Use /bro <tokenId> or /gal <tokenId>.")
 
 
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # quick confirmation that polling loop is alive and env is loaded
+    await update.message.reply_text("OK - Neander Lookup Bot is running.")
+
+
 async def _handle_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, contract: str, label: str, min_id: int) -> None:
     token_id = _parse_token_id(context.args)
     if token_id is None:
@@ -382,8 +408,14 @@ async def gal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_lookup(update, context, GALS, "gal", GALS_MIN_TOKEN_ID)
 
 
+async def _on_shutdown(app: Application) -> None:
+    global _client
+    if _client and not _client.is_closed:
+        await _client.aclose()
+
+
 def main() -> None:
-    # Longer timeouts to reduce random httpx.ReadError during polling
+    # Telegram request tuning (polling)
     request = HTTPXRequest(
         connect_timeout=15.0,
         read_timeout=45.0,
@@ -391,16 +423,15 @@ def main() -> None:
         pool_timeout=15.0,
     )
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .request(request)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("bro", bro_cmd))
     app.add_handler(CommandHandler("gal", gal_cmd))
+
+    # Close httpx client on shutdown
+    app.post_shutdown(_on_shutdown)
 
     # Important for “stuck” bots after downtime
     app.run_polling(drop_pending_updates=True)
