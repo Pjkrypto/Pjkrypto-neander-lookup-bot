@@ -32,7 +32,7 @@ GAL_WEIGHT = float(os.getenv("GAL_WEIGHT", "0.20"))
 MAX_POSTS_PER_24H = int(os.getenv("AUTOPOST_MAX_POSTS_PER_24H", "10"))
 WINDOW_HOURS = int(os.getenv("AUTOPOST_WINDOW_HOURS", "24"))
 
-# Even spacing controls (from your new stack)
+# Even spacing controls (from your stack)
 SCHEDULER_JITTER_PCT = float(os.getenv("SCHEDULER_JITTER_PCT", "0.40"))
 SCHEDULER_MIN_GAP_MINUTES = int(os.getenv("SCHEDULER_MIN_GAP_MINUTES", "120"))
 
@@ -44,7 +44,7 @@ GALS_MIN_TOKEN_ID = int(os.getenv("GALS_MIN_TOKEN_ID", "0"))
 SUPPLY_REFRESH_SECONDS = int(os.getenv("SUPPLY_REFRESH_SECONDS", str(15 * 60)))
 RANDOM_PICK_RETRIES = int(os.getenv("RANDOM_PICK_RETRIES", "6"))
 
-STATE_PATH = os.getenv("SCHEDULER_STATE_PATH", "/opt/bot-state/scheduler_state.json").strip()
+SCHEDULER_STATE_PATH = os.getenv("SCHEDULER_STATE_PATH", "/opt/bot-state/scheduler_state.json").strip()
 MAX_TRAITS = int(os.getenv("MAX_TRAITS", "50"))
 
 if not SCHEDULER_BOT_TOKEN:
@@ -120,7 +120,7 @@ def _display_nft_id(contract: str, token_id: int) -> int:
 # -----------------------
 def _load_state() -> Dict[str, Any]:
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
+        with open(SCHEDULER_STATE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
             return data if isinstance(data, dict) else {}
     except FileNotFoundError:
@@ -130,12 +130,12 @@ def _load_state() -> Dict[str, Any]:
 
 
 def _save_state(state: Dict[str, Any]) -> None:
-    folder = os.path.dirname(STATE_PATH) or "."
+    folder = os.path.dirname(SCHEDULER_STATE_PATH) or "."
     os.makedirs(folder, exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
+    tmp = SCHEDULER_STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f)
-    os.replace(tmp, STATE_PATH)
+    os.replace(tmp, SCHEDULER_STATE_PATH)
 
 
 def _prune_old_post_times(post_times: List[float], now_ts: float) -> List[float]:
@@ -143,19 +143,13 @@ def _prune_old_post_times(post_times: List[float], now_ts: float) -> List[float]
     return [t for t in post_times if t >= cutoff]
 
 
-def _rolling_cap_ok(post_times: List[float]) -> bool:
-    return len(post_times) < MAX_POSTS_PER_24H
-
-
 def _seconds_until_cap_clears(post_times: List[float], now_ts: float) -> int:
-    # when the oldest post falls out of the rolling window
     oldest = min(post_times)
     window_seconds = WINDOW_HOURS * 3600
     return max(60, int((oldest + window_seconds) - now_ts))
 
 
 def _compute_next_delay_seconds() -> int:
-    # Base interval: evenly spread MAX_POSTS_PER_24H across WINDOW_HOURS
     base = int((WINDOW_HOURS * 3600) / max(1, MAX_POSTS_PER_24H))
     jitter = max(0.0, min(SCHEDULER_JITTER_PCT, 0.95))
     factor = 1.0 + random.uniform(-jitter, jitter)
@@ -169,7 +163,7 @@ def _compute_next_delay_seconds() -> int:
 # -----------------------
 DEFAULT_HEADERS = {
     "accept": "application/json",
-    "user-agent": "Mozilla/5.0 (compatible; BroSchedulerBot/1.0)",
+    "user-agent": "Mozilla/5.0 (compatible; NeanderSchedulerBot/1.0)",
 }
 
 _client: Optional[httpx.AsyncClient] = None
@@ -417,7 +411,12 @@ async def _telegram_send_photo_or_message(caption: str, img_bytes: Optional[byte
             data = {"chat_id": AUTOPOST_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
             r = await client.post(f"{base}/sendPhoto", data=data, files=files)
         else:
-            data = {"chat_id": AUTOPOST_CHAT_ID, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}
+            data = {
+                "chat_id": AUTOPOST_CHAT_ID,
+                "text": caption,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
             r = await client.post(f"{base}/sendMessage", data=data)
 
         if r.status_code >= 400:
@@ -466,8 +465,9 @@ async def run_forever() -> None:
     log("Scheduler starting...")
     log(
         f"AUTOPOST_CHAT_ID={AUTOPOST_CHAT_ID!r} CHAIN={CHAIN} "
-        f"CAP={MAX_POSTS_PER_24H}/{WINDOW_HOURS}h JITTER={SCHEDULER_JITTER_PCT} "
-        f"MIN_GAP_MIN={SCHEDULER_MIN_GAP_MINUTES}"
+        f"CAP={MAX_POSTS_PER_24H}/{WINDOW_HOURS}h "
+        f"JITTER={SCHEDULER_JITTER_PCT} MIN_GAP_MIN={SCHEDULER_MIN_GAP_MINUTES} "
+        f"FAIL_BACKOFF_MIN={FAIL_BACKOFF_MINUTES}"
     )
 
     await _startup_test_once()
@@ -483,7 +483,7 @@ async def run_forever() -> None:
             post_times = [float(t) for t in post_times if isinstance(t, (int, float))]
             post_times = _prune_old_post_times(post_times, now_ts)
 
-            # enforce min gap since last post
+            # enforce min gap since last successful post
             last_post_ts = float(state.get("last_post_ts") or 0.0)
             min_gap_sec = max(60, SCHEDULER_MIN_GAP_MINUTES * 60)
             if last_post_ts > 0 and (now_ts - last_post_ts) < min_gap_sec:
@@ -493,7 +493,7 @@ async def run_forever() -> None:
                 continue
 
             # rolling cap
-            if not _rolling_cap_ok(post_times):
+            if len(post_times) >= MAX_POSTS_PER_24H:
                 wait = _seconds_until_cap_clears(post_times, now_ts) + random.randint(60, 10 * 60)
                 state["autopost_times"] = post_times
                 _save_state(state)
@@ -512,13 +512,12 @@ async def run_forever() -> None:
                 await asyncio.sleep(wait)
                 continue
 
-            caption = None
-            img = None
+            caption: Optional[str] = None
+            img: Optional[bytes] = None
             picked_token: Optional[int] = None
 
             # Try random tokenIds until metadata resolves
             for _ in range(max(1, RANDOM_PICK_RETRIES)):
-                # use supply as a loose upper bound
                 token_id = random.randint(min_id, max(min_id, supply - 1))
                 cap, im, err = await _build_post(contract, token_id)
                 if err:
@@ -541,6 +540,9 @@ async def run_forever() -> None:
                 log(f"POSTED ok: {choice} tokenId={picked_token} total_in_window={len(post_times)}/{MAX_POSTS_PER_24H}")
             else:
                 log(f"POST FAILED: {choice} tokenId={picked_token} reason={resp}")
+                # backoff on failure so we don't hammer Telegram/APIs
+                await asyncio.sleep(FAIL_BACKOFF_MINUTES * 60)
+                continue
 
             # schedule next attempt using even spacing + jitter
             delay = _compute_next_delay_seconds()
