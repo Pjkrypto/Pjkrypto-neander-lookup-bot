@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -21,6 +22,11 @@ BROS = os.getenv("NEANDERBROS_CONTRACT", "").strip().lower()
 GALS = os.getenv("NEANDERGALS_CONTRACT", "").strip().lower()
 
 MAX_TRAITS = int(os.getenv("MAX_TRAITS", "50"))
+
+# Alchemy metadata retry protection.
+# Alchemy can occasionally return HTTP 200 with incomplete NFT metadata.
+METADATA_FETCH_RETRIES = int(os.getenv("METADATA_FETCH_RETRIES", "3"))
+METADATA_RETRY_SECONDS = float(os.getenv("METADATA_RETRY_SECONDS", "2"))
 
 # Alchemy
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "").strip()
@@ -150,9 +156,17 @@ async def _get_json(
 # -----------------------
 # ALCHEMY CALLS
 # -----------------------
-async def fetch_nft_metadata_alchemy(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def fetch_nft_metadata_alchemy(
+    contract: str,
+    token_id: int,
+    refresh_cache: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     url = f"{_alchemy_root()}/getNFTMetadata"
-    params = {"contractAddress": contract, "tokenId": str(token_id), "refreshCache": "false"}
+    params = {
+        "contractAddress": contract,
+        "tokenId": str(token_id),
+        "refreshCache": "true" if refresh_cache else "false",
+    }
     return await _get_json(url, params=params)
 
 
@@ -234,13 +248,31 @@ def _format_trait_line(trait_type: str, value: str, pct: Optional[float], minted
     return f"{trait_type}: {value} — ({pct_str})"
 
 
+def _normalize_media_url(url: str) -> str:
+    value = (url or "").strip()
+    if value.startswith("ipfs://"):
+        return "https://ipfs.io/ipfs/" + value[len("ipfs://"):]
+    return value
+
+
 async def _download_image_bytes(url: str) -> Optional[bytes]:
+    media_url = _normalize_media_url(url)
+    if not media_url:
+        return None
+
     try:
         async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            r = await client.get(url, headers={"user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)"})
+            r = await client.get(
+                media_url,
+                headers={"user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)"},
+            )
             r.raise_for_status()
+            if not r.content:
+                print(f"Image download returned empty body: {media_url[:180]}", flush=True)
+                return None
             return r.content
-    except Exception:
+    except Exception as e:
+        print(f"Image download failed: {type(e).__name__}: {e}", flush=True)
         return None
 
 
@@ -278,9 +310,72 @@ async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int
 # MESSAGE BUILD
 # -----------------------
 async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str], Optional[bytes], Optional[str]]:
-    meta, err = await fetch_nft_metadata_alchemy(contract, token_id)
-    if err or not isinstance(meta, dict):
-        return None, None, err or "Metadata not available."
+    meta: Optional[Dict[str, Any]] = None
+    traits: List[Dict[str, Any]] = []
+    image_url: Optional[str] = None
+    img_bytes: Optional[bytes] = None
+    last_error: Optional[str] = None
+
+    attempts = max(1, METADATA_FETCH_RETRIES)
+
+    # Do not accept an HTTP-200 metadata response unless the NFT metadata is
+    # actually complete enough to build the Telegram card. On retries, force
+    # Alchemy to refresh its metadata cache.
+    for attempt in range(attempts):
+        refresh_cache = attempt > 0
+
+        meta, err = await fetch_nft_metadata_alchemy(
+            contract,
+            token_id,
+            refresh_cache=refresh_cache,
+        )
+
+        if err or not isinstance(meta, dict):
+            last_error = err or "Metadata not available."
+            print(
+                f"Metadata fetch failed for tokenId={token_id} "
+                f"attempt={attempt + 1}/{attempts}: {last_error}",
+                flush=True,
+            )
+        else:
+            traits = _extract_traits(meta)
+            image_url = _pick_image_url(meta)
+
+            raw = meta.get("raw")
+            raw_error = raw.get("error") if isinstance(raw, dict) else None
+
+            if not traits or not image_url:
+                last_error = (
+                    f"Incomplete metadata: traits={len(traits)} "
+                    f"image={bool(image_url)} raw_error={raw_error!r}"
+                )
+                print(
+                    f"Incomplete Alchemy metadata for tokenId={token_id} "
+                    f"attempt={attempt + 1}/{attempts}: "
+                    f"traits={len(traits)} image={bool(image_url)} "
+                    f"raw_error={raw_error!r}",
+                    flush=True,
+                )
+            else:
+                img_bytes = await _download_image_bytes(image_url)
+                if img_bytes:
+                    break
+
+                last_error = f"Image download failed for tokenId={token_id}"
+                print(
+                    f"{last_error} attempt={attempt + 1}/{attempts}",
+                    flush=True,
+                )
+
+        if attempt + 1 < attempts:
+            await asyncio.sleep(max(0.0, METADATA_RETRY_SECONDS))
+
+    if not isinstance(meta, dict) or not traits or not image_url or not img_bytes:
+        return (
+            None,
+            None,
+            "NFT metadata is temporarily unavailable. Please try this command again in a few seconds."
+        )
 
     minted_so_far, _ = await fetch_total_supply_alchemy(contract)
 
@@ -301,7 +396,6 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
     if minted_so_far and minted_so_far > 0:
         header2 += f" of {minted_so_far}"
 
-    traits = _extract_traits(meta)
     trait_lines: List[str] = []
     for a in traits[:MAX_TRAITS]:
         tt = a.get("trait_type") or a.get("type") or a.get("traitType") or "Trait"
@@ -312,7 +406,12 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
         pct = trait_pct_map.get((_norm(tt), _norm(vv_s)))
         trait_lines.append(_format_trait_line(tt, vv_s, pct, minted_so_far))
 
-    traits_text = "\n".join(trait_lines) if trait_lines else "(No traits returned.)"
+    if not trait_lines:
+        return (
+            None,
+            None,
+            "NFT metadata is temporarily unavailable. Please try this command again in a few seconds."
+        )
 
     rarity_lines = ["<b>Rarity (OpenSea)</b>"]
     if os_rank is not None:
@@ -327,14 +426,9 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
         f"{header2}\n\n"
         f"{'\n'.join(rarity_lines)}\n\n"
         f"<b>Traits</b>\n"
-        f"{traits_text}\n\n"
+        f"{'\n'.join(trait_lines)}\n\n"
         f"<a href=\"{os_url}\">View on OpenSea</a>"
     )
-
-    image_url = _pick_image_url(meta)
-    img_bytes: Optional[bytes] = None
-    if image_url:
-        img_bytes = await _download_image_bytes(image_url)
 
     return caption, img_bytes, None
 
