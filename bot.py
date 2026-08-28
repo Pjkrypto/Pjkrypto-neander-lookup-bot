@@ -5,6 +5,8 @@ import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+import discord
+from discord import app_commands
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -36,6 +38,26 @@ ALCHEMY_BASE_URL = os.getenv("ALCHEMY_BASE_URL", "").strip().rstrip("/")
 # OpenSea
 OPENSEA_API_KEY = os.getenv("OPENSEA_API_KEY", "").strip()
 
+# Discord lookup bot
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+DISCORD_APPLICATION_ID = os.getenv("DISCORD_APPLICATION_ID", "").strip()
+DISCORD_GUILD_ID_RAW = os.getenv("DISCORD_GUILD_ID", "").strip()
+DISCORD_CHANNEL_ID_RAW = os.getenv("DISCORD_CHANNEL_ID", "").strip()
+
+try:
+    DISCORD_GUILD_ID = int(DISCORD_GUILD_ID_RAW) if DISCORD_GUILD_ID_RAW else 0
+except ValueError:
+    DISCORD_GUILD_ID = 0
+
+try:
+    DISCORD_CHANNEL_ID = int(DISCORD_CHANNEL_ID_RAW) if DISCORD_CHANNEL_ID_RAW else 0
+except ValueError:
+    DISCORD_CHANNEL_ID = 0
+
+DISCORD_ENABLED = bool(
+    DISCORD_BOT_TOKEN and DISCORD_GUILD_ID and DISCORD_CHANNEL_ID
+)
+
 # Bros have no token 0 (per your known info)
 BROS_MIN_TOKEN_ID = int(os.getenv("BROS_MIN_TOKEN_ID", "1"))
 GALS_MIN_TOKEN_ID = int(os.getenv("GALS_MIN_TOKEN_ID", "0"))
@@ -50,6 +72,13 @@ if not BROS:
     raise SystemExit("Missing NEANDERBROS_CONTRACT")
 if not GALS:
     raise SystemExit("Missing NEANDERGALS_CONTRACT")
+
+if not DISCORD_ENABLED:
+    print(
+        "Discord lookup disabled: set DISCORD_BOT_TOKEN, "
+        "DISCORD_GUILD_ID, and DISCORD_CHANNEL_ID to enable /bro and /gal.",
+        flush=True,
+    )
 
 
 # -----------------------
@@ -434,6 +463,162 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
 
 
 # -----------------------
+# DISCORD
+# -----------------------
+def _discord_text_from_telegram_html(text: str) -> str:
+    value = text or ""
+
+    value = re.sub(
+        r'<a\s+href="([^"]+)">([^<]+)</a>',
+        lambda m: f"[{m.group(2)}]({m.group(1)})",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    value = re.sub(
+        r"<b>(.*?)</b>",
+        r"**\1**",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    value = re.sub(r"<[^>]+>", "", value)
+    return value.strip()
+
+
+discord_intents = discord.Intents.none()
+discord_intents.guilds = True
+discord_client = discord.Client(intents=discord_intents)
+discord_tree = app_commands.CommandTree(discord_client)
+_discord_synced = False
+
+
+async def _discord_lookup(
+    interaction: discord.Interaction,
+    contract: str,
+    token_id: int,
+    label: str,
+    min_id: int,
+) -> None:
+    if interaction.channel_id != DISCORD_CHANNEL_ID:
+        await interaction.response.send_message(
+            "Please use this lookup command in the NeanderBros general-chat channel.",
+            ephemeral=True,
+        )
+        return
+
+    if token_id < min_id:
+        minimum_display = min_id + DISPLAY_ID_OFFSETS.get(contract.lower(), 0)
+        await interaction.response.send_message(
+            f"{label} NFT number must be >= {minimum_display}.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    caption, img_bytes, err = await build_nft_message(contract, token_id)
+
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"{_collection_label(contract)} Lookup",
+        description=_discord_text_from_telegram_html(caption or ""),
+    )
+
+    if img_bytes:
+        bio = io.BytesIO(img_bytes)
+        bio.seek(0)
+        file = discord.File(bio, filename="nft.png")
+        embed.set_image(url="attachment://nft.png")
+        await interaction.followup.send(embed=embed, file=file)
+    else:
+        await interaction.followup.send(embed=embed)
+
+
+async def discord_bro_cmd(
+    interaction: discord.Interaction,
+    number: int,
+) -> None:
+    # Discord users enter the displayed Bro NFT number.
+    # Bros display tokenId+1, so /bro 1386 looks up raw token 1385.
+    token_id = number - DISPLAY_ID_OFFSETS.get(BROS, 0)
+    await _discord_lookup(
+        interaction,
+        BROS,
+        token_id,
+        "NeanderBro",
+        BROS_MIN_TOKEN_ID,
+    )
+
+
+async def discord_gal_cmd(
+    interaction: discord.Interaction,
+    number: int,
+) -> None:
+    # Gals display the raw token ID, so no offset is applied.
+    token_id = number - DISPLAY_ID_OFFSETS.get(GALS, 0)
+    await _discord_lookup(
+        interaction,
+        GALS,
+        token_id,
+        "NeanderGal",
+        GALS_MIN_TOKEN_ID,
+    )
+
+
+if DISCORD_ENABLED:
+    guild_object = discord.Object(id=DISCORD_GUILD_ID)
+
+    discord_bro_cmd = app_commands.describe(
+        number="NeanderBro NFT number, e.g. 1386"
+    )(discord_bro_cmd)
+    discord_gal_cmd = app_commands.describe(
+        number="NeanderGal NFT number, e.g. 91"
+    )(discord_gal_cmd)
+
+    discord_tree.command(
+        name="bro",
+        description="Look up a NeanderBro NFT",
+        guild=guild_object,
+    )(discord_bro_cmd)
+
+    discord_tree.command(
+        name="gal",
+        description="Look up a NeanderGal NFT",
+        guild=guild_object,
+    )(discord_gal_cmd)
+
+
+@discord_client.event
+async def on_ready() -> None:
+    global _discord_synced
+
+    print(
+        f"Discord connected as {discord_client.user} "
+        f"(guild={DISCORD_GUILD_ID}, channel={DISCORD_CHANNEL_ID})",
+        flush=True,
+    )
+
+    if not DISCORD_ENABLED or _discord_synced:
+        return
+
+    try:
+        guild_object = discord.Object(id=DISCORD_GUILD_ID)
+        synced = await discord_tree.sync(guild=guild_object)
+        _discord_synced = True
+        print(
+            "Discord guild commands synced: "
+            + (", ".join("/" + cmd.name for cmd in synced) or "none"),
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"Discord command sync failed: {exc}", flush=True)
+
+
+# -----------------------
 # HANDLERS
 # -----------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -476,7 +661,7 @@ async def gal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_lookup(update, context, GALS, "gal", GALS_MIN_TOKEN_ID)
 
 
-def main() -> None:
+async def _run_services() -> None:
     request = HTTPXRequest(
         connect_timeout=15.0,
         read_timeout=45.0,
@@ -495,7 +680,37 @@ def main() -> None:
     app.add_handler(CommandHandler("bro", bro_cmd))
     app.add_handler(CommandHandler("gal", gal_cmd))
 
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+
+    if app.updater is None:
+        raise RuntimeError("Telegram updater was not created.")
+
+    await app.updater.start_polling(drop_pending_updates=True)
+    print("Telegram lookup polling started.", flush=True)
+
+    try:
+        if DISCORD_ENABLED:
+            print("Starting Discord lookup bot...", flush=True)
+            await discord_client.start(DISCORD_BOT_TOKEN)
+        else:
+            await asyncio.Event().wait()
+    finally:
+        if DISCORD_ENABLED and not discord_client.is_closed():
+            await discord_client.close()
+
+        if app.updater.running:
+            await app.updater.stop()
+
+        await app.stop()
+        await app.shutdown()
+
+
+def main() -> None:
+    try:
+        asyncio.run(_run_services())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
