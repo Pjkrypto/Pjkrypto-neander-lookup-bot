@@ -2,6 +2,7 @@ import os
 import re
 import io
 import asyncio
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -37,6 +38,7 @@ ALCHEMY_BASE_URL = os.getenv("ALCHEMY_BASE_URL", "").strip().rstrip("/")
 
 # OpenSea
 OPENSEA_API_KEY = os.getenv("OPENSEA_API_KEY", "").strip()
+OPENSEA_TRAIT_CACHE_SECONDS = int(os.getenv("OPENSEA_TRAIT_CACHE_SECONDS", "900"))
 
 # Discord lookup bot
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
@@ -273,8 +275,20 @@ def _format_trait_line(trait_type: str, value: str, pct: Optional[float], minted
     pct_str = f"{pct:.2f}%"
     if minted_so_far and minted_so_far > 0:
         count = int(round((pct / 100.0) * minted_so_far))
-        return f"{trait_type}: {value} — {count} ({pct_str})"
+        return f"{trait_type}: {value} — {count:,} ({pct_str})"
     return f"{trait_type}: {value} — ({pct_str})"
+
+
+def _format_trait_count_line(
+    trait_type: str,
+    value: str,
+    count: int,
+    minted_so_far: Optional[int],
+) -> str:
+    if minted_so_far and minted_so_far > 0:
+        pct = (count / float(minted_so_far)) * 100.0
+        return f"{trait_type}: {value} — {count:,} ({pct:.2f}%)"
+    return f"{trait_type}: {value} — {count:,}"
 
 
 def _normalize_media_url(url: str) -> str:
@@ -306,33 +320,187 @@ async def _download_image_bytes(url: str) -> Optional[bytes]:
 
 
 # -----------------------
-# OPENSEA CALL (RARITY RANK)
+# OPENSEA CALLS (RANK + COLLECTION TRAIT COUNTS)
 # -----------------------
-async def fetch_opensea_rank(contract: str, token_id: int) -> Tuple[Optional[int], Optional[str]]:
-    url = f"https://api.opensea.io/api/v2/chain/{CHAIN}/contract/{contract}/nfts/{token_id}"
-    headers = {
+def _opensea_headers() -> Dict[str, str]:
+    return {
         "accept": "application/json",
         "x-api-key": OPENSEA_API_KEY,
         "user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)",
     }
-    data, err = await _get_json(url, params=None, headers=headers, timeout=25.0)
-    if err:
-        return None, err
 
+
+def _extract_opensea_nft(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     nft = data.get("nft") if isinstance(data, dict) else None
-    if not isinstance(nft, dict):
-        nft = data if isinstance(data, dict) else None
-    if not isinstance(nft, dict):
-        return None, "Unexpected OpenSea response."
+    if isinstance(nft, dict):
+        return nft
+    return data if isinstance(data, dict) else None
 
+
+def _extract_opensea_collection_slug(nft: Dict[str, Any]) -> Optional[str]:
+    collection = nft.get("collection")
+    if isinstance(collection, str) and collection.strip():
+        return collection.strip()
+    if isinstance(collection, dict):
+        for key in ("slug", "collection", "collection_slug"):
+            value = collection.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    for key in ("collection_slug", "collectionSlug"):
+        value = nft.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+async def fetch_opensea_rank_and_collection(
+    contract: str,
+    token_id: int,
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    url = f"https://api.opensea.io/api/v2/chain/{CHAIN}/contract/{contract}/nfts/{token_id}"
+    data, err = await _get_json(
+        url,
+        params=None,
+        headers=_opensea_headers(),
+        timeout=25.0,
+    )
+    if err:
+        return None, None, err
+
+    nft = _extract_opensea_nft(data or {})
+    if not isinstance(nft, dict):
+        return None, None, "Unexpected OpenSea response."
+
+    rank: Optional[int] = None
     rarity = nft.get("rarity")
     if isinstance(rarity, dict):
         rank = _safe_int(rarity.get("rank"))
-        if rank is not None:
-            return rank, None
 
-    rank = _safe_int(nft.get("rarity_rank") or nft.get("rarityRank"))
-    return rank, None
+    if rank is None:
+        rank = _safe_int(nft.get("rarity_rank") or nft.get("rarityRank"))
+
+    return rank, _extract_opensea_collection_slug(nft), None
+
+
+def _count_from_opensea_value(value: Any) -> Optional[int]:
+    direct = _safe_int(value)
+    if direct is not None:
+        return direct
+    if isinstance(value, dict):
+        for key in ("count", "total", "quantity", "value_count"):
+            parsed = _safe_int(value.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _build_trait_count_map_from_opensea(
+    traits_resp: Dict[str, Any],
+) -> Dict[Tuple[str, str], int]:
+    out: Dict[Tuple[str, str], int] = {}
+
+    # Current OpenSea V2 traits response exposes categorical value counts under
+    # counts[trait_type][trait_value]. Keep the parser permissive because the
+    # API has used more than one wrapper shape over time.
+    counts = traits_resp.get("counts")
+    if isinstance(counts, dict):
+        for trait_type, values in counts.items():
+            if not isinstance(values, dict):
+                continue
+            for trait_value, raw_count in values.items():
+                count = _count_from_opensea_value(raw_count)
+                if count is None:
+                    continue
+                out[(_norm(trait_type), _norm(trait_value))] = count
+
+    # Alternate/wrapped shapes: categories may contain a values/counts object.
+    categories = traits_resp.get("categories")
+    if isinstance(categories, dict):
+        for trait_type, category in categories.items():
+            if not isinstance(category, dict):
+                continue
+            values = category.get("values") or category.get("counts")
+            if not isinstance(values, dict):
+                continue
+            for trait_value, raw_count in values.items():
+                count = _count_from_opensea_value(raw_count)
+                if count is None:
+                    continue
+                out[(_norm(trait_type), _norm(trait_value))] = count
+
+    # Also accept list-style trait payloads if OpenSea returns them.
+    traits = traits_resp.get("traits")
+    if isinstance(traits, list):
+        for trait in traits:
+            if not isinstance(trait, dict):
+                continue
+            trait_type = (
+                trait.get("trait_type")
+                or trait.get("traitType")
+                or trait.get("type")
+                or trait.get("name")
+            )
+            values = trait.get("values") or trait.get("counts")
+            if trait_type is None or not isinstance(values, (list, dict)):
+                continue
+
+            if isinstance(values, dict):
+                iterable = values.items()
+            else:
+                iterable = []
+                for item in values:
+                    if not isinstance(item, dict):
+                        continue
+                    trait_value = item.get("value") or item.get("name")
+                    if trait_value is not None:
+                        iterable.append((trait_value, item))
+
+            for trait_value, raw_count in iterable:
+                count = _count_from_opensea_value(raw_count)
+                if count is None:
+                    continue
+                out[(_norm(trait_type), _norm(trait_value))] = count
+
+    return out
+
+
+_OPENSEA_TRAIT_CACHE: Dict[
+    str,
+    Tuple[float, Dict[Tuple[str, str], int]],
+] = {}
+
+
+async def fetch_opensea_trait_counts(
+    collection_slug: str,
+) -> Tuple[Dict[Tuple[str, str], int], Optional[str]]:
+    slug = (collection_slug or "").strip()
+    if not slug:
+        return {}, "OpenSea collection slug is unavailable."
+
+    now = time.monotonic()
+    cached = _OPENSEA_TRAIT_CACHE.get(slug)
+    if cached is not None:
+        cached_at, cached_map = cached
+        if now - cached_at < max(0, OPENSEA_TRAIT_CACHE_SECONDS):
+            return cached_map, None
+
+    url = f"https://api.opensea.io/api/v2/traits/{slug}"
+    data, err = await _get_json(
+        url,
+        params=None,
+        headers=_opensea_headers(),
+        timeout=25.0,
+    )
+    if err:
+        return {}, err
+
+    count_map = _build_trait_count_map_from_opensea(data or {})
+    if not count_map:
+        return {}, "OpenSea trait response contained no categorical value counts."
+
+    _OPENSEA_TRAIT_CACHE[slug] = (now, count_map)
+    return count_map, None
 
 
 # -----------------------
@@ -408,14 +576,37 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
 
     minted_so_far, _ = await fetch_total_supply_alchemy(contract)
 
-    rarity_resp, r_err = await fetch_compute_rarity_alchemy(contract, token_id)
-    trait_pct_map: Dict[Tuple[str, str], float] = {}
-    if not r_err and isinstance(rarity_resp, dict):
-        trait_pct_map = _build_trait_pct_map_from_alchemy(rarity_resp)
-
-    os_rank, os_rank_err = await fetch_opensea_rank(contract, token_id)
+    os_rank, os_collection_slug, os_rank_err = await fetch_opensea_rank_and_collection(
+        contract,
+        token_id,
+    )
     if os_rank_err:
         os_rank = None
+
+    # Prefer OpenSea's collection-level trait counts. This keeps the displayed
+    # trait rarity aligned with the marketplace source used for the rank.
+    trait_count_map: Dict[Tuple[str, str], int] = {}
+    os_traits_err: Optional[str] = None
+    if os_collection_slug:
+        trait_count_map, os_traits_err = await fetch_opensea_trait_counts(
+            os_collection_slug
+        )
+    else:
+        os_traits_err = "OpenSea NFT response did not include a collection slug."
+
+    # Temporary fallback while Alchemy computeRarity is still available.
+    trait_pct_map: Dict[Tuple[str, str], float] = {}
+    if not trait_count_map:
+        rarity_resp, r_err = await fetch_compute_rarity_alchemy(contract, token_id)
+        if not r_err and isinstance(rarity_resp, dict):
+            trait_pct_map = _build_trait_pct_map_from_alchemy(rarity_resp)
+
+        if os_traits_err:
+            print(
+                f"OpenSea trait counts unavailable for tokenId={token_id}: "
+                f"{os_traits_err}",
+                flush=True,
+            )
 
     coll = _collection_label(contract)
     nft_id = _display_nft_id(contract, token_id)
@@ -432,8 +623,15 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
         if not isinstance(tt, str) or vv is None:
             continue
         vv_s = str(vv)
-        pct = trait_pct_map.get((_norm(tt), _norm(vv_s)))
-        trait_lines.append(_format_trait_line(tt, vv_s, pct, minted_so_far))
+        trait_key = (_norm(tt), _norm(vv_s))
+        count = trait_count_map.get(trait_key)
+        if count is not None:
+            trait_lines.append(
+                _format_trait_count_line(tt, vv_s, count, minted_so_far)
+            )
+        else:
+            pct = trait_pct_map.get(trait_key)
+            trait_lines.append(_format_trait_line(tt, vv_s, pct, minted_so_far))
 
     if not trait_lines:
         return (
