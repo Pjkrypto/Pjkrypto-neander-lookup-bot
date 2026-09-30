@@ -877,9 +877,8 @@ async def _discord_lookup(
         return
 
     if token_id < min_id:
-        minimum_display = min_id + DISPLAY_ID_OFFSETS.get(contract.lower(), 0)
         await interaction.response.send_message(
-            f"{label} NFT number must be >= {minimum_display}.",
+            f"{label} Token ID must be >= {min_id}.",
             ephemeral=True,
         )
         return
@@ -911,9 +910,8 @@ async def discord_bro_cmd(
     interaction: discord.Interaction,
     number: int,
 ) -> None:
-    # Discord users enter the displayed Bro NFT number.
-    # Bros display tokenId+1, so /bro 1386 looks up raw token 1385.
-    token_id = number - DISPLAY_ID_OFFSETS.get(BROS, 0)
+    # Commands always use the canonical on-chain token ID.
+    token_id = number
     await _discord_lookup(
         interaction,
         BROS,
@@ -942,10 +940,10 @@ if DISCORD_ENABLED:
     guild_object = discord.Object(id=DISCORD_GUILD_ID)
 
     discord_bro_cmd = app_commands.describe(
-        number="NeanderBro NFT number, e.g. 1386"
+        number="NeanderBro on-chain Token ID, e.g. 1385"
     )(discord_bro_cmd)
     discord_gal_cmd = app_commands.describe(
-        number="NeanderGal NFT number, e.g. 91"
+        number="NeanderGal on-chain Token ID, e.g. 91"
     )(discord_gal_cmd)
 
     discord_tree.command(
@@ -991,7 +989,7 @@ async def on_ready() -> None:
 # HANDLERS
 # -----------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Ready. Use /bro <NFT number> or /gal <NFT number>.")
+    await update.message.reply_text("Ready. Use /bro <Token ID> or /gal <Token ID>.")
 
 
 async def _handle_lookup(
@@ -1004,12 +1002,12 @@ async def _handle_lookup(
 ) -> None:
     entered_number = _parse_token_id(context.args)
     if entered_number is None:
-        await update.message.reply_text(f"Usage: /{label} <NFT number>  (example: /{label} 33)")
+        await update.message.reply_text(f"Usage: /{label} <Token ID>  (example: /{label} 33)")
         return
     token_id = entered_number - display_offset
     if token_id < min_id:
-        minimum_display = min_id + display_offset
-        await update.message.reply_text(f"{label.upper()} NFT number must be >= {minimum_display}.")
+        minimum_token_id = min_id + display_offset
+        await update.message.reply_text(f"{label.upper()} Token ID must be >= {minimum_token_id}.")
         return
 
     await update.message.chat.send_action(action="typing")
@@ -1049,7 +1047,7 @@ async def bro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         BROS,
         "bro",
         BROS_MIN_TOKEN_ID,
-        DISPLAY_ID_OFFSETS.get(BROS, 0),
+        0,
     )
 
 
@@ -1060,7 +1058,7 @@ async def gal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         GALS,
         "gal",
         GALS_MIN_TOKEN_ID,
-        DISPLAY_ID_OFFSETS.get(GALS, 0),
+        0,
     )
 
 
