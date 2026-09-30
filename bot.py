@@ -26,8 +26,8 @@ GALS = os.getenv("NEANDERGALS_CONTRACT", "").strip().lower()
 
 MAX_TRAITS = int(os.getenv("MAX_TRAITS", "50"))
 
-# Alchemy metadata retry protection.
-# Alchemy can occasionally return HTTP 200 with incomplete NFT metadata.
+# Metadata retry protection. OpenSea is the primary source; Alchemy is an
+# optional final fallback for older/cached items.
 METADATA_FETCH_RETRIES = int(os.getenv("METADATA_FETCH_RETRIES", "3"))
 METADATA_RETRY_SECONDS = float(os.getenv("METADATA_RETRY_SECONDS", "2"))
 
@@ -66,8 +66,6 @@ GALS_MIN_TOKEN_ID = int(os.getenv("GALS_MIN_TOKEN_ID", "0"))
 
 if not TELEGRAM_BOT_TOKEN:
     raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
-if not ALCHEMY_API_KEY:
-    raise SystemExit("Missing ALCHEMY_API_KEY")
 if not OPENSEA_API_KEY:
     raise SystemExit("Missing OPENSEA_API_KEY")
 if not BROS:
@@ -354,10 +352,51 @@ def _extract_opensea_collection_slug(nft: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-async def fetch_opensea_rank_and_collection(
+def _extract_opensea_traits(nft: Dict[str, Any]) -> List[Dict[str, Any]]:
+    traits = nft.get("traits")
+    if not isinstance(traits, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for trait in traits:
+        if not isinstance(trait, dict):
+            continue
+        trait_type = (
+            trait.get("trait_type")
+            or trait.get("traitType")
+            or trait.get("type")
+        )
+        value = trait.get("value")
+        if trait_type is not None and value is not None:
+            out.append({"trait_type": str(trait_type), "value": value})
+    return out
+
+
+def _pick_opensea_image_url(nft: Dict[str, Any]) -> Optional[str]:
+    for key in (
+        "display_image_url",
+        "image_url",
+        "original_image_url",
+        "cached_image_url",
+    ):
+        value = nft.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _pick_opensea_metadata_url(nft: Dict[str, Any]) -> Optional[str]:
+    for key in ("metadata_url", "token_metadata", "token_uri"):
+        value = nft.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+async def fetch_opensea_nft(
     contract: str,
     token_id: int,
-) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     url = f"https://api.opensea.io/api/v2/chain/{CHAIN}/contract/{contract}/nfts/{token_id}"
     data, err = await _get_json(
         url,
@@ -366,11 +405,64 @@ async def fetch_opensea_rank_and_collection(
         timeout=25.0,
     )
     if err:
-        return None, None, err
+        return None, err
 
     nft = _extract_opensea_nft(data or {})
     if not isinstance(nft, dict):
-        return None, None, "Unexpected OpenSea response."
+        return None, "Unexpected OpenSea response."
+    return nft, None
+
+
+async def fetch_token_metadata_url(
+    metadata_url: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    url = _normalize_media_url(metadata_url)
+    if not url:
+        return None, "NFT metadata URL is unavailable."
+    return await _get_json(
+        url,
+        params=None,
+        headers={"user-agent": "Mozilla/5.0 (compatible; NeanderLookupBot/1.0)"},
+        timeout=25.0,
+    )
+
+
+async def fetch_opensea_metadata(
+    contract: str,
+    token_id: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    url = f"https://api.opensea.io/api/v2/metadata/{CHAIN}/{contract}/{token_id}"
+    return await _get_json(
+        url,
+        params=None,
+        headers=_opensea_headers(),
+        timeout=25.0,
+    )
+
+
+async def fetch_opensea_total_supply(
+    contract: str,
+    token_id: int,
+) -> Tuple[Optional[int], Optional[str]]:
+    url = f"https://api.opensea.io/api/v2/chain/{CHAIN}/contract/{contract}/nfts/{token_id}/collection"
+    data, err = await _get_json(
+        url,
+        params=None,
+        headers=_opensea_headers(),
+        timeout=25.0,
+    )
+    if err:
+        return None, err
+    return _safe_int((data or {}).get("total_supply")), None
+
+
+async def fetch_opensea_rank_and_collection(
+    contract: str,
+    token_id: int,
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    nft, err = await fetch_opensea_nft(contract, token_id)
+    if err or not isinstance(nft, dict):
+        return None, None, err or "Unexpected OpenSea response."
 
     rank: Optional[int] = None
     rarity = nft.get("rarity")
@@ -512,60 +604,91 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
     image_url: Optional[str] = None
     img_bytes: Optional[bytes] = None
     last_error: Optional[str] = None
+    opensea_nft: Optional[Dict[str, Any]] = None
 
     attempts = max(1, METADATA_FETCH_RETRIES)
 
-    # Do not accept an HTTP-200 metadata response unless the NFT metadata is
-    # actually complete enough to build the Telegram card. On retries, force
-    # Alchemy to refresh its metadata cache.
+    # OpenSea is the primary NFT metadata source. If its item response has not
+    # indexed the attributes yet, follow its metadata URL and read the token
+    # JSON directly from IPFS.
     for attempt in range(attempts):
-        refresh_cache = attempt > 0
-
-        meta, err = await fetch_nft_metadata_alchemy(
-            contract,
-            token_id,
-            refresh_cache=refresh_cache,
-        )
-
-        if err or not isinstance(meta, dict):
-            last_error = err or "Metadata not available."
+        opensea_nft, err = await fetch_opensea_nft(contract, token_id)
+        if err or not isinstance(opensea_nft, dict):
+            last_error = err or "OpenSea metadata not available."
             print(
-                f"Metadata fetch failed for tokenId={token_id} "
+                f"OpenSea metadata fetch failed for tokenId={token_id} "
                 f"attempt={attempt + 1}/{attempts}: {last_error}",
                 flush=True,
             )
         else:
-            traits = _extract_traits(meta)
-            image_url = _pick_image_url(meta)
-
-            raw = meta.get("raw")
-            raw_error = raw.get("error") if isinstance(raw, dict) else None
+            traits = _extract_opensea_traits(opensea_nft)
+            image_url = _pick_opensea_image_url(opensea_nft)
 
             if not traits or not image_url:
-                last_error = (
-                    f"Incomplete metadata: traits={len(traits)} "
-                    f"image={bool(image_url)} raw_error={raw_error!r}"
+                detailed_meta, detailed_err = await fetch_opensea_metadata(
+                    contract,
+                    token_id,
                 )
-                print(
-                    f"Incomplete Alchemy metadata for tokenId={token_id} "
-                    f"attempt={attempt + 1}/{attempts}: "
-                    f"traits={len(traits)} image={bool(image_url)} "
-                    f"raw_error={raw_error!r}",
-                    flush=True,
-                )
-            else:
+                if isinstance(detailed_meta, dict):
+                    detailed_traits = detailed_meta.get("traits")
+                    if not traits and isinstance(detailed_traits, list):
+                        traits = [a for a in detailed_traits if isinstance(a, dict)]
+                    detailed_image = detailed_meta.get("image")
+                    if not image_url and isinstance(detailed_image, str):
+                        image_url = detailed_image.strip()
+                elif detailed_err:
+                    last_error = detailed_err
+
+            metadata_url = _pick_opensea_metadata_url(opensea_nft)
+            if (not traits or not image_url) and metadata_url:
+                direct_meta, direct_err = await fetch_token_metadata_url(metadata_url)
+                if isinstance(direct_meta, dict):
+                    attrs = direct_meta.get("attributes")
+                    if not traits and isinstance(attrs, list):
+                        traits = [a for a in attrs if isinstance(a, dict)]
+                    direct_image = direct_meta.get("image") or direct_meta.get("image_url")
+                    if not image_url and isinstance(direct_image, str):
+                        image_url = direct_image.strip()
+                elif direct_err:
+                    last_error = direct_err
+
+            if traits and image_url:
                 img_bytes = await _download_image_bytes(image_url)
                 if img_bytes:
+                    meta = opensea_nft
                     break
-
-                last_error = f"Image download failed for tokenId={token_id}"
+                last_error = f"OpenSea image download failed for tokenId={token_id}"
+            else:
+                last_error = f"Incomplete OpenSea metadata: traits={len(traits)} image={bool(image_url)}"
                 print(
-                    f"{last_error} attempt={attempt + 1}/{attempts}",
+                    f"Incomplete OpenSea metadata for tokenId={token_id} "
+                    f"attempt={attempt + 1}/{attempts}: "
+                    f"traits={len(traits)} image={bool(image_url)}",
                     flush=True,
                 )
 
         if attempt + 1 < attempts:
             await asyncio.sleep(max(0.0, METADATA_RETRY_SECONDS))
+
+    # Optional legacy fallback. Alchemy can help when OpenSea is briefly behind,
+    # but it can no longer prevent the OpenSea/direct-IPFS path from running.
+    if (not traits or not image_url or not img_bytes) and ALCHEMY_API_KEY:
+        for attempt in range(attempts):
+            alchemy_meta, err = await fetch_nft_metadata_alchemy(
+                contract,
+                token_id,
+                refresh_cache=attempt > 0,
+            )
+            if isinstance(alchemy_meta, dict) and not err:
+                traits = _extract_traits(alchemy_meta)
+                image_url = _pick_image_url(alchemy_meta)
+                if traits and image_url:
+                    img_bytes = await _download_image_bytes(image_url)
+                    if img_bytes:
+                        meta = alchemy_meta
+                        break
+            if attempt + 1 < attempts:
+                await asyncio.sleep(max(0.0, METADATA_RETRY_SECONDS))
 
     if not isinstance(meta, dict) or not traits or not image_url or not img_bytes:
         return (
@@ -574,14 +697,24 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
             "NFT metadata is temporarily unavailable. Please try this command again in a few seconds."
         )
 
-    minted_so_far, _ = await fetch_total_supply_alchemy(contract)
+    minted_so_far, _ = await fetch_opensea_total_supply(contract, token_id)
+    if minted_so_far is None and ALCHEMY_API_KEY:
+        minted_so_far, _ = await fetch_total_supply_alchemy(contract)
 
-    os_rank, os_collection_slug, os_rank_err = await fetch_opensea_rank_and_collection(
-        contract,
-        token_id,
-    )
-    if os_rank_err:
-        os_rank = None
+    if isinstance(opensea_nft, dict):
+        rarity = opensea_nft.get("rarity")
+        os_rank = _safe_int(rarity.get("rank")) if isinstance(rarity, dict) else None
+        if os_rank is None:
+            os_rank = _safe_int(opensea_nft.get("rarity_rank") or opensea_nft.get("rarityRank"))
+        os_collection_slug = _extract_opensea_collection_slug(opensea_nft)
+        os_rank_err = None
+    else:
+        os_rank, os_collection_slug, os_rank_err = await fetch_opensea_rank_and_collection(
+            contract,
+            token_id,
+        )
+        if os_rank_err:
+            os_rank = None
 
     # Prefer OpenSea's collection-level trait counts. This keeps the displayed
     # trait rarity aligned with the marketplace source used for the rank.
@@ -596,7 +729,7 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
 
     # Temporary fallback while Alchemy computeRarity is still available.
     trait_pct_map: Dict[Tuple[str, str], float] = {}
-    if not trait_count_map:
+    if not trait_count_map and ALCHEMY_API_KEY:
         rarity_resp, r_err = await fetch_compute_rarity_alchemy(contract, token_id)
         if not r_err and isinstance(rarity_resp, dict):
             trait_pct_map = _build_trait_pct_map_from_alchemy(rarity_resp)
