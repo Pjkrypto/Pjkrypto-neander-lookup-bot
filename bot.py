@@ -953,16 +953,25 @@ async def on_ready() -> None:
 # HANDLERS
 # -----------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Ready. Use /bro <tokenId> or /gal <tokenId>.")
+    await update.message.reply_text("Ready. Use /bro <NFT number> or /gal <NFT number>.")
 
 
-async def _handle_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, contract: str, label: str, min_id: int) -> None:
-    token_id = _parse_token_id(context.args)
-    if token_id is None:
-        await update.message.reply_text(f"Usage: /{label} <tokenId>  (example: /{label} 33)")
+async def _handle_lookup(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    contract: str,
+    label: str,
+    min_id: int,
+    display_offset: int = 0,
+) -> None:
+    entered_number = _parse_token_id(context.args)
+    if entered_number is None:
+        await update.message.reply_text(f"Usage: /{label} <NFT number>  (example: /{label} 33)")
         return
+    token_id = entered_number - display_offset
     if token_id < min_id:
-        await update.message.reply_text(f"{label.upper()} tokenId must be >= {min_id}.")
+        minimum_display = min_id + display_offset
+        await update.message.reply_text(f"{label.upper()} NFT number must be >= {minimum_display}.")
         return
 
     await update.message.chat.send_action(action="typing")
@@ -985,11 +994,25 @@ async def _handle_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE, con
 
 
 async def bro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_lookup(update, context, BROS, "bro", BROS_MIN_TOKEN_ID)
+    await _handle_lookup(
+        update,
+        context,
+        BROS,
+        "bro",
+        BROS_MIN_TOKEN_ID,
+        DISPLAY_ID_OFFSETS.get(BROS, 0),
+    )
 
 
 async def gal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _handle_lookup(update, context, GALS, "gal", GALS_MIN_TOKEN_ID)
+    await _handle_lookup(
+        update,
+        context,
+        GALS,
+        "gal",
+        GALS_MIN_TOKEN_ID,
+        DISPLAY_ID_OFFSETS.get(GALS, 0),
+    )
 
 
 async def _run_services() -> None:
