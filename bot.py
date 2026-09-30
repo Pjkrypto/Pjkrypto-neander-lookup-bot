@@ -7,9 +7,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import discord
+from PIL import Image, ImageOps, UnidentifiedImageError
 from discord import app_commands
 from telegram import Update, InputFile
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 
@@ -314,6 +316,42 @@ async def _download_image_bytes(url: str) -> Optional[bytes]:
             return r.content
     except Exception as e:
         print(f"Image download failed: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _prepare_telegram_photo(image_bytes: bytes) -> Optional[bytes]:
+    """Convert OpenSea/CDN formats such as WebP or GIF to Telegram-safe PNG."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            source.seek(0)
+            image = ImageOps.exif_transpose(source.copy())
+            image.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+            if image.mode not in ("RGB", "RGBA"):
+                image = image.convert("RGBA")
+
+            output = io.BytesIO()
+            image.save(output, format="PNG", optimize=True)
+            converted = output.getvalue()
+
+            # Telegram photos are limited to 10 MB. Use JPEG as a compact
+            # fallback for an unusually large decoded PNG.
+            if len(converted) > 9_500_000:
+                if image.mode == "RGBA":
+                    background = Image.new("RGB", image.size, "black")
+                    background.paste(image, mask=image.getchannel("A"))
+                    image = background
+                else:
+                    image = image.convert("RGB")
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=92, optimize=True)
+                converted = output.getvalue()
+
+            return converted if converted else None
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        print(
+            f"Telegram image conversion failed: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
         return None
 
 
@@ -981,16 +1019,27 @@ async def _handle_lookup(
         await update.message.reply_text(err)
         return
 
-    if img_bytes:
-        bio = io.BytesIO(img_bytes)
+    telegram_photo = _prepare_telegram_photo(img_bytes) if img_bytes else None
+    if telegram_photo:
+        bio = io.BytesIO(telegram_photo)
         bio.name = "nft.png"
-        await update.message.reply_photo(
-            photo=InputFile(bio),
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await update.message.reply_text(caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        try:
+            await update.message.reply_photo(
+                photo=InputFile(bio),
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except BadRequest as exc:
+            print(f"Telegram rejected converted NFT image: {exc}", flush=True)
+
+    # Always return the lookup details even when Telegram rejects a marketplace
+    # image. Discord can continue using the original image bytes.
+    await update.message.reply_text(
+        caption,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=False,
+    )
 
 
 async def bro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
