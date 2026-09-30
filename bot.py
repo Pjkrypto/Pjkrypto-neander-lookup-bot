@@ -779,13 +779,13 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
                 flush=True,
             )
 
-    coll = _collection_label(contract)
     nft_id = _display_nft_id(contract, token_id)
 
-    header1 = f"<b>{coll} NFT ID #{nft_id}</b>"
-    header2 = f"Token ID #{token_id}"
+    display_name = "NeanderBro" if contract.lower() == BROS else "NeanderGal"
+    header1 = f"<b>{display_name} #{nft_id}</b>"
+    header2 = f"On-chain Token ID: {token_id}"
     if minted_so_far and minted_so_far > 0:
-        header2 += f" of {minted_so_far}"
+        header2 += f" • Total minted: {minted_so_far}"
 
     trait_lines: List[str] = []
     for a in traits[:MAX_TRAITS]:
@@ -877,8 +877,9 @@ async def _discord_lookup(
         return
 
     if token_id < min_id:
+        minimum_display = min_id + DISPLAY_ID_OFFSETS.get(contract.lower(), 0)
         await interaction.response.send_message(
-            f"{label} Token ID must be >= {min_id}.",
+            f"{label} NFT number must be >= {minimum_display}.",
             ephemeral=True,
         )
         return
@@ -910,8 +911,8 @@ async def discord_bro_cmd(
     interaction: discord.Interaction,
     number: int,
 ) -> None:
-    # Commands always use the canonical on-chain token ID.
-    token_id = number
+    # Community commands use the displayed NFT number. Bros display tokenId+1.
+    token_id = number - DISPLAY_ID_OFFSETS.get(BROS, 0)
     await _discord_lookup(
         interaction,
         BROS,
@@ -940,10 +941,10 @@ if DISCORD_ENABLED:
     guild_object = discord.Object(id=DISCORD_GUILD_ID)
 
     discord_bro_cmd = app_commands.describe(
-        number="NeanderBro on-chain Token ID, e.g. 1385"
+        number="Visible NeanderBro NFT number, e.g. 1386"
     )(discord_bro_cmd)
     discord_gal_cmd = app_commands.describe(
-        number="NeanderGal on-chain Token ID, e.g. 91"
+        number="Visible NeanderGal NFT number, e.g. 91"
     )(discord_gal_cmd)
 
     discord_tree.command(
@@ -989,7 +990,7 @@ async def on_ready() -> None:
 # HANDLERS
 # -----------------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Ready. Use /bro <Token ID> or /gal <Token ID>.")
+    await update.message.reply_text("Ready. Use /bro <NFT number> or /gal <NFT number>.")
 
 
 async def _handle_lookup(
@@ -1002,12 +1003,12 @@ async def _handle_lookup(
 ) -> None:
     entered_number = _parse_token_id(context.args)
     if entered_number is None:
-        await update.message.reply_text(f"Usage: /{label} <Token ID>  (example: /{label} 33)")
+        await update.message.reply_text(f"Usage: /{label} <NFT number>  (example: /{label} 33)")
         return
     token_id = entered_number - display_offset
     if token_id < min_id:
-        minimum_token_id = min_id + display_offset
-        await update.message.reply_text(f"{label.upper()} Token ID must be >= {minimum_token_id}.")
+        minimum_nft_number = min_id + display_offset
+        await update.message.reply_text(f"{label.upper()} NFT number must be >= {minimum_nft_number}.")
         return
 
     await update.message.chat.send_action(action="typing")
@@ -1047,7 +1048,7 @@ async def bro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         BROS,
         "bro",
         BROS_MIN_TOKEN_ID,
-        0,
+        DISPLAY_ID_OFFSETS.get(BROS, 0),
     )
 
 
