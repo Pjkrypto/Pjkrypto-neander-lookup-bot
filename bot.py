@@ -201,12 +201,6 @@ async def fetch_nft_metadata_alchemy(
     return await _get_json(url, params=params)
 
 
-async def fetch_compute_rarity_alchemy(contract: str, token_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    url = f"{_alchemy_root()}/computeRarity"
-    params = {"contractAddress": contract, "tokenId": str(token_id)}
-    return await _get_json(url, params=params)
-
-
 async def fetch_total_supply_alchemy(contract: str) -> Tuple[Optional[int], Optional[str]]:
     url = f"{_alchemy_root()}/getContractMetadata"
     params = {"contractAddress": contract}
@@ -765,19 +759,16 @@ async def build_nft_message(contract: str, token_id: int) -> Tuple[Optional[str]
     else:
         os_traits_err = "OpenSea NFT response did not include a collection slug."
 
-    # Temporary fallback while Alchemy computeRarity is still available.
+    # OpenSea trait counts are the sole source for trait rarity percentages.
+    # If OpenSea trait statistics are temporarily unavailable, the bot
+    # gracefully displays the trait without a rarity percentage.
     trait_pct_map: Dict[Tuple[str, str], float] = {}
-    if not trait_count_map and ALCHEMY_API_KEY:
-        rarity_resp, r_err = await fetch_compute_rarity_alchemy(contract, token_id)
-        if not r_err and isinstance(rarity_resp, dict):
-            trait_pct_map = _build_trait_pct_map_from_alchemy(rarity_resp)
-
-        if os_traits_err:
-            print(
-                f"OpenSea trait counts unavailable for tokenId={token_id}: "
-                f"{os_traits_err}",
-                flush=True,
-            )
+    if not trait_count_map and os_traits_err:
+        print(
+            f"OpenSea trait counts unavailable for tokenId={token_id}: "
+            f"{os_traits_err}",
+            flush=True,
+        )
 
     nft_id = _display_nft_id(contract, token_id)
 
